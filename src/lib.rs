@@ -1,0 +1,15 @@
+//! LocalGPT - A lightweight, local-only AI assistant with persistent memory
+//!
+//! This crate provides the core functionality for LocalGPT, including:
+//! - Agent core with LLM provider abstraction
+//! - Memory system with markdown files and SQLite index
+//! - Heartbeat runner for continuous operation
+//! - HTTP server for UI integration
+
+pub mod agent;
+pub mod config;
+pub mod heartbeat;
+pub mod memory;
+pub mod server;
+
+pub use config::Config;
