@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Args;
 use futures::StreamExt;
-use std::io::{self, BufRead, Write};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+use std::io::{self, Write};
 
 use localgpt::agent::{Agent, AgentConfig};
 use localgpt::config::Config;
@@ -45,22 +47,34 @@ pub async fn run(args: ChatArgs) -> Result<()> {
     );
     println!("Type /help for commands, /quit to exit\n");
 
-    let stdin = io::stdin();
+    let mut rl = DefaultEditor::new()?;
     let mut stdout = io::stdout();
 
     loop {
-        print!("You: ");
-        stdout.flush()?;
+        let readline = rl.readline("You: ");
 
-        let mut input = String::new();
-        if stdin.lock().read_line(&mut input)? == 0 {
-            break; // EOF
-        }
+        let input = match readline {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                break; // Ctrl+D
+            }
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                break;
+            }
+        };
 
         let input = input.trim();
         if input.is_empty() {
             continue;
         }
+
+        // Add to history
+        let _ = rl.add_history_entry(input);
 
         // Handle commands
         if input.starts_with('/') {
