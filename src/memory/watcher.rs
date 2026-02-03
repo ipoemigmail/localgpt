@@ -55,7 +55,8 @@ impl MemoryWatcher {
         let workspace_for_task = workspace.clone();
         let db_path_for_task = db_path.clone();
         std::thread::spawn(move || {
-            let index = match MemoryIndex::new_with_db_path(&workspace_for_task, &db_path_for_task) {
+            let index = match MemoryIndex::new_with_db_path(&workspace_for_task, &db_path_for_task)
+            {
                 Ok(idx) => idx,
                 Err(e) => {
                     warn!("Failed to create memory index for watcher: {}", e);

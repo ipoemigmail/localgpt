@@ -280,6 +280,37 @@ impl MemoryManager {
             }
         }
 
+        // Index configured paths (e.g., knowledge/)
+        for index_path in &self.config.paths {
+            let base_path = if index_path.path.starts_with('~') || index_path.path.starts_with('/')
+            {
+                PathBuf::from(shellexpand::tilde(&index_path.path).to_string())
+            } else {
+                self.workspace.join(&index_path.path)
+            };
+
+            if !base_path.exists() {
+                debug!("Skipping non-existent index path: {}", base_path.display());
+                continue;
+            }
+
+            let pattern = format!("{}/{}", base_path.display(), index_path.pattern);
+            debug!("Indexing path with pattern: {}", pattern);
+
+            for entry in glob::glob(&pattern)
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.ok())
+            {
+                if entry.is_file() {
+                    stats.files_processed += 1;
+                    if self.index.index_file(&entry, force)? {
+                        stats.files_updated += 1;
+                    }
+                }
+            }
+        }
+
         stats.chunks_indexed = self.index.chunk_count()?;
         stats.duration = start.elapsed();
 
@@ -333,6 +364,50 @@ impl MemoryManager {
                     total_chunks += chunks;
                     files.push(FileStats {
                         name: format!("memory/{}", path.file_name().unwrap().to_string_lossy()),
+                        chunks,
+                        lines,
+                    });
+                }
+            }
+        }
+
+        // Configured paths (e.g., knowledge/)
+        for index_path in &self.config.paths {
+            let base_path = if index_path.path.starts_with('~') || index_path.path.starts_with('/')
+            {
+                PathBuf::from(shellexpand::tilde(&index_path.path).to_string())
+            } else {
+                self.workspace.join(&index_path.path)
+            };
+
+            if !base_path.exists() {
+                continue;
+            }
+
+            let pattern = format!("{}/{}", base_path.display(), index_path.pattern);
+
+            for entry in glob::glob(&pattern)
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.ok())
+            {
+                if entry.is_file() {
+                    let content = fs::read_to_string(&entry)?;
+                    let lines = content.lines().count();
+                    let chunks = self.index.file_chunk_count(&entry)?;
+                    total_chunks += chunks;
+
+                    // Show path relative to workspace if possible, otherwise use relative to base_path
+                    let display_name = if let Ok(rel) = entry.strip_prefix(&self.workspace) {
+                        rel.display().to_string()
+                    } else if let Ok(rel) = entry.strip_prefix(&base_path) {
+                        format!("{}/{}", index_path.path, rel.display())
+                    } else {
+                        entry.display().to_string()
+                    };
+
+                    files.push(FileStats {
+                        name: display_name,
                         chunks,
                         lines,
                     });
@@ -396,7 +471,11 @@ impl MemoryManager {
 
     /// Start file watcher for automatic reindexing
     pub fn start_watcher(&self) -> Result<MemoryWatcher> {
-        MemoryWatcher::new(self.workspace.clone(), self.db_path.clone(), self.config.clone())
+        MemoryWatcher::new(
+            self.workspace.clone(),
+            self.db_path.clone(),
+            self.config.clone(),
+        )
     }
 
     /// Generate embeddings for chunks that don't have them

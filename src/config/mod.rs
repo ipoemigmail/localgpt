@@ -125,6 +125,18 @@ pub struct MemoryConfig {
 
     #[serde(default = "default_chunk_overlap")]
     pub chunk_overlap: usize,
+
+    /// Additional paths to index (relative to workspace or absolute)
+    /// Each path uses a glob pattern for file matching
+    #[serde(default = "default_index_paths")]
+    pub paths: Vec<MemoryIndexPath>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryIndexPath {
+    pub path: String,
+    #[serde(default = "default_pattern")]
+    pub pattern: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +207,15 @@ fn default_chunk_size() -> usize {
 fn default_chunk_overlap() -> usize {
     80
 }
+fn default_index_paths() -> Vec<MemoryIndexPath> {
+    vec![MemoryIndexPath {
+        path: "knowledge".to_string(),
+        pattern: "**/*.md".to_string(),
+    }]
+}
+fn default_pattern() -> String {
+    "**/*.md".to_string()
+}
 fn default_port() -> u16 {
     31327
 }
@@ -260,6 +281,7 @@ impl Default for MemoryConfig {
             embedding_model: default_embedding_model(),
             chunk_size: default_chunk_size(),
             chunk_overlap: default_chunk_overlap(),
+            paths: default_index_paths(),
         }
     }
 }
