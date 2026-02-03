@@ -100,102 +100,150 @@ pub trait LLMProvider: Send + Sync {
     }
 }
 
-pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvider>> {
-    let workspace = config.workspace_path();
-
-    // Claude CLI: prefix "claude-cli/"
-    if model.starts_with("claude-cli/") {
-        let model_name = model.strip_prefix("claude-cli/").unwrap_or("opus");
-        let cli_config = config.providers.claude_cli.as_ref();
-        let command = cli_config.map(|c| c.command.as_str()).unwrap_or("claude");
-        return Ok(Box::new(ClaudeCliProvider::new(
-            command, model_name, workspace,
-        )?));
-    }
-
-    // Anthropic shorthand: "anthropic/opus", "anthropic/sonnet", "anthropic/haiku"
-    if model.starts_with("anthropic/") {
-        let model_name = model.strip_prefix("anthropic/").unwrap_or("sonnet");
-        let full_model = normalize_anthropic_model(model_name);
-        let anthropic_config = config
-            .providers
-            .anthropic
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!(
-                "Anthropic provider not configured. Set ANTHROPIC_API_KEY or add [providers.anthropic] to config.toml"
-            ))?;
-
-        return Ok(Box::new(AnthropicProvider::new(
-            &anthropic_config.api_key,
-            &anthropic_config.base_url,
-            &full_model,
-        )?));
-    }
-
-    // Determine provider from model name
-    if model.starts_with("gpt-") || model.starts_with("o1") {
-        let openai_config = config
-            .providers
-            .openai
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!(
-                "OpenAI provider not configured. Set OPENAI_API_KEY or add [providers.openai] to config.toml"
-            ))?;
-
-        Ok(Box::new(OpenAIProvider::new(
-            &openai_config.api_key,
-            &openai_config.base_url,
-            model,
-        )?))
-    } else if model.starts_with("claude-") {
-        // Full Anthropic model name (e.g., "claude-sonnet-4-5-20250514")
-        let anthropic_config = config
-            .providers
-            .anthropic
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!(
-                "Anthropic provider not configured. Set ANTHROPIC_API_KEY or add [providers.anthropic] to config.toml"
-            ))?;
-
-        Ok(Box::new(AnthropicProvider::new(
-            &anthropic_config.api_key,
-            &anthropic_config.base_url,
-            model,
-        )?))
-    } else if let Some(ollama_config) = &config.providers.ollama {
-        Ok(Box::new(OllamaProvider::new(
-            &ollama_config.endpoint,
-            model,
-        )?))
-    } else if let Some(cli_config) = &config.providers.claude_cli {
-        // Final fallback: try Claude CLI if configured
-        Ok(Box::new(ClaudeCliProvider::new(
-            &cli_config.command,
-            &cli_config.model,
-            workspace,
-        )?))
-    } else {
-        anyhow::bail!(
-            "Unknown model '{}'. Use one of:\n  \
-            - anthropic/opus, anthropic/sonnet, anthropic/haiku\n  \
-            - claude-sonnet-4-5-20250514, claude-3-opus-20240229\n  \
-            - claude-cli/opus, claude-cli/sonnet\n  \
-            - gpt-4o, gpt-4o-mini\n  \
-            - Or configure [providers.ollama] for local models",
-            model
-        )
+/// Resolve model alias to provider/model format (OpenClaw-compatible)
+fn resolve_model_alias(model: &str) -> String {
+    // OpenClaw-compatible aliases
+    match model.to_lowercase().as_str() {
+        // Short aliases (OpenClaw defaults.ts pattern)
+        "opus" => "anthropic/claude-opus-4-5".to_string(),
+        "sonnet" => "anthropic/claude-sonnet-4-5".to_string(),
+        "haiku" => "anthropic/claude-3-5-haiku".to_string(),
+        "gpt" => "openai/gpt-4o".to_string(),
+        "gpt-mini" => "openai/gpt-4o-mini".to_string(),
+        _ => model.to_string(),
     }
 }
 
-/// Map shorthand Anthropic model names to full model IDs
-fn normalize_anthropic_model(shorthand: &str) -> String {
-    match shorthand.to_lowercase().as_str() {
-        "opus" | "opus-4" => "claude-sonnet-4-5-20250514".to_string(), // Note: Opus 4 not released yet, use Sonnet
-        "sonnet" | "sonnet-4" => "claude-sonnet-4-5-20250514".to_string(),
-        "haiku" | "haiku-3.5" => "claude-3-5-haiku-20241022".to_string(),
-        "sonnet-3.5" => "claude-3-5-sonnet-20241022".to_string(),
-        "opus-3" => "claude-3-opus-20240229".to_string(),
-        other => other.to_string(), // Pass through full model names
+/// Map OpenClaw model ID to actual API model ID
+fn normalize_model_id(provider: &str, model_id: &str) -> String {
+    match provider {
+        "anthropic" => {
+            match model_id.to_lowercase().as_str() {
+                // OpenClaw format: claude-opus-4-5, claude-sonnet-4-5
+                "claude-opus-4-5" | "opus-4.5" | "opus" => "claude-sonnet-4-5-20250514".to_string(), // Opus 4 not yet available
+                "claude-sonnet-4-5" | "sonnet-4.5" | "sonnet" => "claude-sonnet-4-5-20250514".to_string(),
+                "claude-3-5-haiku" | "haiku-3.5" | "haiku" => "claude-3-5-haiku-20241022".to_string(),
+                "claude-3-5-sonnet" | "sonnet-3.5" => "claude-3-5-sonnet-20241022".to_string(),
+                "claude-3-opus" | "opus-3" => "claude-3-opus-20240229".to_string(),
+                other => other.to_string(),
+            }
+        }
+        _ => model_id.to_string(),
+    }
+}
+
+pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvider>> {
+    let workspace = config.workspace_path();
+
+    // Resolve aliases first (e.g., "opus" → "anthropic/claude-opus-4-5")
+    let model = resolve_model_alias(model);
+
+    // Parse provider/model format (OpenClaw-compatible)
+    let (provider, model_id) = if let Some(pos) = model.find('/') {
+        let (p, m) = model.split_at(pos);
+        (p.to_lowercase(), m[1..].to_string()) // Skip the '/'
+    } else if model.starts_with("gpt-") || model.starts_with("o1") {
+        ("openai".to_string(), model.clone())
+    } else if model.starts_with("claude-") {
+        ("anthropic".to_string(), model.clone())
+    } else {
+        // Default to anthropic for unknown models, or ollama if configured
+        if config.providers.ollama.is_some() {
+            ("ollama".to_string(), model.clone())
+        } else if config.providers.anthropic.is_some() {
+            ("anthropic".to_string(), model.clone())
+        } else {
+            ("unknown".to_string(), model.clone())
+        }
+    };
+
+    match provider.as_str() {
+        "anthropic" => {
+            let anthropic_config = config
+                .providers
+                .anthropic
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Anthropic provider not configured.\n\
+                    Set ANTHROPIC_API_KEY env var or add to ~/.localgpt/config.toml:\n\n\
+                    [providers.anthropic]\n\
+                    api_key = \"sk-ant-...\""
+                ))?;
+
+            let full_model = normalize_model_id("anthropic", &model_id);
+            Ok(Box::new(AnthropicProvider::new(
+                &anthropic_config.api_key,
+                &anthropic_config.base_url,
+                &full_model,
+            )?))
+        }
+
+        "openai" => {
+            let openai_config = config
+                .providers
+                .openai
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "OpenAI provider not configured.\n\
+                    Set OPENAI_API_KEY env var or add to ~/.localgpt/config.toml:\n\n\
+                    [providers.openai]\n\
+                    api_key = \"sk-...\""
+                ))?;
+
+            Ok(Box::new(OpenAIProvider::new(
+                &openai_config.api_key,
+                &openai_config.base_url,
+                &model_id,
+            )?))
+        }
+
+        "claude-cli" => {
+            let cli_config = config.providers.claude_cli.as_ref();
+            let command = cli_config.map(|c| c.command.as_str()).unwrap_or("claude");
+            Ok(Box::new(ClaudeCliProvider::new(
+                command, &model_id, workspace,
+            )?))
+        }
+
+        "ollama" => {
+            let ollama_config = config
+                .providers
+                .ollama
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Ollama provider not configured.\n\
+                    Add to ~/.localgpt/config.toml:\n\n\
+                    [providers.ollama]\n\
+                    endpoint = \"http://localhost:11434\""
+                ))?;
+
+            Ok(Box::new(OllamaProvider::new(
+                &ollama_config.endpoint,
+                &model_id,
+            )?))
+        }
+
+        _ => {
+            // Fallback: try Claude CLI if configured
+            if let Some(cli_config) = &config.providers.claude_cli {
+                return Ok(Box::new(ClaudeCliProvider::new(
+                    &cli_config.command,
+                    &cli_config.model,
+                    workspace,
+                )?));
+            }
+
+            anyhow::bail!(
+                "Unknown provider '{}' for model '{}'.\n\n\
+                Supported formats (OpenClaw-compatible):\n  \
+                - anthropic/claude-opus-4-5, anthropic/claude-sonnet-4-5\n  \
+                - openai/gpt-4o, openai/gpt-4o-mini\n  \
+                - claude-cli/opus, claude-cli/sonnet\n  \
+                - ollama/llama3, ollama/mistral\n\n\
+                Or use aliases: opus, sonnet, haiku, gpt, gpt-mini",
+                provider, model
+            )
+        }
     }
 }
 

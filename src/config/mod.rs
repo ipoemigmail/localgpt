@@ -151,8 +151,8 @@ pub struct LoggingConfig {
 // Default value functions
 fn default_model() -> String {
     // Default to Anthropic API (requires ANTHROPIC_API_KEY)
-    // Use shorthand "anthropic/sonnet" which maps to latest Sonnet model
-    "anthropic/sonnet".to_string()
+    // OpenClaw-compatible format: provider/model-id
+    "anthropic/claude-opus-4-5".to_string()
 }
 fn default_context_window() -> usize {
     128000
