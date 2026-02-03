@@ -156,7 +156,12 @@ daemon.pid
 # Logs
 logs/
 
-# Database files
+# Memory index SQLite database (OpenClaw-compatible location)
+memory/*.sqlite
+memory/*.sqlite-wal
+memory/*.sqlite-shm
+
+# Database files (legacy)
 *.db
 *.db-wal
 *.db-shm

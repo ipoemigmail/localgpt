@@ -55,7 +55,16 @@ impl MemoryManager {
         // Initialize workspace with templates if needed
         init_workspace(&workspace)?;
 
-        let index = MemoryIndex::new(&workspace)?;
+        // Database goes in state_dir/memory/{agentId}.sqlite (OpenClaw-compatible)
+        // For now, we use "main" as the agent ID
+        let state_dir = workspace
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Workspace has no parent directory"))?;
+        let memory_dir = state_dir.join("memory");
+        std::fs::create_dir_all(&memory_dir)?;
+        let db_path = memory_dir.join("main.sqlite");
+
+        let index = MemoryIndex::new_with_db_path(&workspace, &db_path)?;
 
         Ok(Self {
             workspace,

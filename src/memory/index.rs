@@ -13,6 +13,7 @@ use super::search::MemoryChunk;
 pub struct MemoryIndex {
     conn: Arc<Mutex<Connection>>,
     workspace: PathBuf,
+    db_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -24,9 +25,14 @@ pub struct ReindexStats {
 }
 
 impl MemoryIndex {
-    pub fn new(workspace: &Path) -> Result<Self> {
-        let db_path = workspace.join("memory.sqlite");
-        let conn = Connection::open(&db_path)?;
+    /// Create a new memory index with database at the specified path
+    pub fn new_with_db_path(workspace: &Path, db_path: &Path) -> Result<Self> {
+        // Ensure parent directory exists
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let conn = Connection::open(db_path)?;
 
         // Initialize schema
         conn.execute_batch(
@@ -75,7 +81,14 @@ impl MemoryIndex {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             workspace: workspace.to_path_buf(),
+            db_path: db_path.to_path_buf(),
         })
+    }
+
+    /// Create a new memory index with database in workspace (legacy path)
+    pub fn new(workspace: &Path) -> Result<Self> {
+        let db_path = workspace.join("memory.sqlite");
+        Self::new_with_db_path(workspace, &db_path)
     }
 
     /// Index a file, returning true if it was updated
@@ -214,12 +227,16 @@ impl MemoryIndex {
 
     /// Get database size in bytes
     pub fn size_bytes(&self) -> Result<u64> {
-        let db_path = self.workspace.join("memory.sqlite");
-        if db_path.exists() {
-            Ok(fs::metadata(&db_path)?.len())
+        if self.db_path.exists() {
+            Ok(fs::metadata(&self.db_path)?.len())
         } else {
             Ok(0)
         }
+    }
+
+    /// Get the database path
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 }
 
