@@ -251,6 +251,7 @@ async fn handle_command(input: &str, agent: &mut Agent, agent_id: &str) -> Comma
             println!("  /compact          - Compact session history");
             println!("  /clear            - Clear session history (keeps context)");
             println!("  /memory <query>   - Search memory");
+            println!("  /reindex          - Rebuild memory index");
             println!("  /save             - Save current session");
             println!("  /status           - Show session status");
             println!();
@@ -367,22 +368,34 @@ async fn handle_command(input: &str, agent: &mut Agent, agent_id: &str) -> Comma
             let query = parts[1..].join(" ");
             match agent.search_memory(&query).await {
                 Ok(results) => {
-                    println!("\nMemory search results for '{}':", query);
-                    for (i, result) in results.iter().enumerate() {
-                        println!(
-                            "{}. [{}:{}] {}",
-                            i + 1,
-                            result.file,
-                            result.line_start,
-                            result.content.chars().take(100).collect::<String>()
-                        );
+                    if results.is_empty() {
+                        println!("\nNo results found for '{}'. Try /reindex to rebuild memory index.\n", query);
+                    } else {
+                        println!("\nMemory search results for '{}':", query);
+                        for (i, result) in results.iter().enumerate() {
+                            println!(
+                                "{}. [{}:{}] {}",
+                                i + 1,
+                                result.file,
+                                result.line_start,
+                                result.content.chars().take(100).collect::<String>()
+                            );
+                        }
+                        println!();
                     }
-                    println!();
                     CommandResult::Continue
                 }
                 Err(e) => CommandResult::Error(format!("Memory search failed: {}", e)),
             }
         }
+
+        "/reindex" => match agent.reindex_memory() {
+            Ok((files, chunks)) => {
+                println!("\nMemory index rebuilt: {} files, {} chunks\n", files, chunks);
+                CommandResult::Continue
+            }
+            Err(e) => CommandResult::Error(format!("Failed to reindex: {}", e)),
+        },
 
         "/save" => match agent.save_session().await {
             Ok(path) => {

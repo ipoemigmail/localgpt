@@ -420,6 +420,11 @@ impl Agent {
         self.memory.search(query, 10)
     }
 
+    pub fn reindex_memory(&self) -> Result<(usize, usize)> {
+        let stats = self.memory.reindex(true)?;
+        Ok((stats.files_processed, stats.chunks_indexed))
+    }
+
     pub async fn save_session(&self) -> Result<PathBuf> {
         self.session.save()
     }
