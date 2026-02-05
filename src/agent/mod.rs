@@ -523,6 +523,18 @@ impl Agent {
             return Ok(None);
         }
 
+        // Get config settings for session memory
+        let max_messages = self.app_config.memory.session_max_messages;
+        let max_chars = self.app_config.memory.session_max_chars;
+
+        // Limit messages by count (0 = unlimited), take from end like OpenClaw
+        let messages: Vec<_> = if max_messages > 0 && messages.len() > max_messages {
+            let skip_count = messages.len() - max_messages;
+            messages.into_iter().skip(skip_count).collect()
+        } else {
+            messages
+        };
+
         // Generate slug from first user message
         let slug = messages
             .iter()
@@ -550,9 +562,16 @@ impl Agent {
                 Role::Assistant => "**Assistant**",
                 _ => continue,
             };
-            // Truncate long messages
-            let msg_content: String = msg.content.chars().take(500).collect();
-            let truncated = if msg.content.len() > 500 { "..." } else { "" };
+            // Only truncate if max_chars > 0 (0 = unlimited, preserves full content)
+            let (msg_content, truncated) =
+                if max_chars > 0 && msg.content.chars().count() > max_chars {
+                    (
+                        msg.content.chars().take(max_chars).collect::<String>(),
+                        "...",
+                    )
+                } else {
+                    (msg.content.clone(), "")
+                };
             content.push_str(&format!("{}: {}{}\n\n", role, msg_content, truncated));
         }
 

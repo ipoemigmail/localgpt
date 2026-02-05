@@ -157,6 +157,16 @@ pub struct MemoryConfig {
     /// Each path uses a glob pattern for file matching
     #[serde(default = "default_index_paths")]
     pub paths: Vec<MemoryIndexPath>,
+
+    /// Maximum messages to save in session memory files (0 = unlimited)
+    /// Similar to OpenClaw's hooks.session-memory.messages (default: 15)
+    #[serde(default = "default_session_max_messages")]
+    pub session_max_messages: usize,
+
+    /// Maximum characters per message in session memory (0 = unlimited)
+    /// Set to 0 to preserve full message content like OpenClaw
+    #[serde(default)]
+    pub session_max_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +265,9 @@ fn default_index_paths() -> Vec<MemoryIndexPath> {
 fn default_pattern() -> String {
     "**/*.md".to_string()
 }
+fn default_session_max_messages() -> usize {
+    15 // Match OpenClaw's default
+}
 fn default_port() -> u16 {
     31327
 }
@@ -309,6 +322,8 @@ impl Default for MemoryConfig {
             chunk_size: default_chunk_size(),
             chunk_overlap: default_chunk_overlap(),
             paths: default_index_paths(),
+            session_max_messages: default_session_max_messages(),
+            session_max_chars: 0, // 0 = unlimited (preserve full content like OpenClaw)
         }
     }
 }
@@ -524,6 +539,10 @@ interval = "30m"
 #   LOCALGPT_WORKSPACE=/path/to/workspace  - absolute path override
 #   LOCALGPT_PROFILE=work                  - uses ~/.localgpt/workspace-work
 workspace = "~/.localgpt/workspace"
+
+# Session memory settings (for /new command)
+# session_max_messages = 15    # Max messages to save (0 = unlimited)
+# session_max_chars = 0        # Max chars per message (0 = unlimited, preserves full content)
 
 [server]
 enabled = true
