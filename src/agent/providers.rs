@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info};
@@ -1259,8 +1260,9 @@ pub struct ClaudeCliProvider {
     session_key: String,
     /// LocalGPT session ID (for session store tracking)
     localgpt_session_id: String,
-    /// CLI session ID for multi-turn conversations (interior mutability for &self methods)
-    cli_session_id: StdMutex<Option<String>>,
+    /// CLI session ID for multi-turn conversations (Arc-wrapped so chat_stream closures
+    /// can write back to the same mutex, keeping in-memory state in sync)
+    cli_session_id: Arc<StdMutex<Option<String>>>,
 }
 
 /// Provider name for CLI session storage
@@ -1282,7 +1284,7 @@ impl ClaudeCliProvider {
             workspace,
             session_key,
             localgpt_session_id: uuid::Uuid::new_v4().to_string(),
-            cli_session_id: StdMutex::new(existing_session),
+            cli_session_id: Arc::new(StdMutex::new(existing_session)),
         })
     }
 
@@ -1648,11 +1650,10 @@ impl LLMProvider for ClaudeCliProvider {
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
 
-        // Clone session state for the stream closure
-        let cli_session_id = self.cli_session_id.lock().ok().and_then(|g| g.clone());
+        // Share the same Arc<Mutex> so the stream closure writes back to self
+        let cli_session_mutex = self.cli_session_id.clone();
         let session_key = self.session_key.clone();
         let localgpt_session_id = self.localgpt_session_id.clone();
-        let cli_session_mutex = std::sync::Arc::new(StdMutex::new(cli_session_id));
 
         // Create the stream
         let stream = async_stream::stream! {
@@ -1900,8 +1901,9 @@ pub struct CodexCliProvider {
     session_key: String,
     /// LocalGPT session ID (for session store tracking)
     localgpt_session_id: String,
-    /// Codex thread ID for multi-turn conversations (interior mutability for &self methods)
-    cli_session_id: StdMutex<Option<String>>,
+    /// Codex thread ID for multi-turn conversations (Arc-wrapped so chat_stream closures
+    /// can write back to the same mutex, keeping in-memory state in sync)
+    cli_session_id: Arc<StdMutex<Option<String>>>,
 }
 
 /// Provider name for Codex CLI session storage
@@ -1923,7 +1925,7 @@ impl CodexCliProvider {
             workspace,
             session_key,
             localgpt_session_id: uuid::Uuid::new_v4().to_string(),
-            cli_session_id: StdMutex::new(existing_session),
+            cli_session_id: Arc::new(StdMutex::new(existing_session)),
         })
     }
 
@@ -2170,16 +2172,21 @@ impl LLMProvider for CodexCliProvider {
         let prompt = build_prompt_from_messages(messages);
         let system_prompt = extract_system_prompt(messages);
 
-        // Combine system prompt into user prompt (Codex exec has no --system-prompt flag)
-        let full_prompt =
-            Self::build_prompt_with_system(&prompt, system_prompt.as_deref());
-
         // Get current CLI session state
         let current_cli_session = self
             .cli_session_id
             .lock()
             .map_err(|e| anyhow::anyhow!("Session lock poisoned: {}", e))?
             .clone();
+
+        // Only inline system prompt on new sessions; on resume the Codex thread
+        // already has the system context, so re-sending it wastes tokens
+        let is_resume = current_cli_session.is_some();
+        let full_prompt = if is_resume {
+            prompt
+        } else {
+            Self::build_prompt_with_system(&prompt, system_prompt.as_deref())
+        };
 
         // Execute with retry
         let (stdout, _used_new_session) = self
@@ -2240,8 +2247,6 @@ impl LLMProvider for CodexCliProvider {
     ) -> Result<StreamResult> {
         let prompt = build_prompt_from_messages(messages);
         let system_prompt = extract_system_prompt(messages);
-        let full_prompt =
-            Self::build_prompt_with_system(&prompt, system_prompt.as_deref());
 
         // Get current CLI session state
         let current_cli_session = self
@@ -2249,6 +2254,15 @@ impl LLMProvider for CodexCliProvider {
             .lock()
             .map_err(|e| anyhow::anyhow!("Session lock poisoned: {}", e))?
             .clone();
+
+        // Only inline system prompt on new sessions; on resume the Codex thread
+        // already has the system context, so re-sending it wastes tokens
+        let is_resume = current_cli_session.is_some();
+        let full_prompt = if is_resume {
+            prompt
+        } else {
+            Self::build_prompt_with_system(&prompt, system_prompt.as_deref())
+        };
 
         // Build args based on session state
         let args = if let Some(ref tid) = current_cli_session {
@@ -2276,12 +2290,10 @@ impl LLMProvider for CodexCliProvider {
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
 
-        // Clone session state for the stream closure
+        // Share the same Arc<Mutex> so the stream closure writes back to self
         let session_key = self.session_key.clone();
         let localgpt_session_id = self.localgpt_session_id.clone();
-        let cli_session_mutex = std::sync::Arc::new(StdMutex::new(
-            current_cli_session.clone(),
-        ));
+        let cli_session_mutex = self.cli_session_id.clone();
 
         // Create the stream
         let stream = async_stream::stream! {
