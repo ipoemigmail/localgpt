@@ -1738,7 +1738,8 @@ impl LLMProvider for ClaudeCliProvider {
 
                             // Calculate delta (new text since last update)
                             if accumulated_text.len() > last_text_len {
-                                let delta = accumulated_text[last_text_len..].to_string();
+                                let safe_start = accumulated_text.floor_char_boundary(last_text_len);
+                                let delta = accumulated_text[safe_start..].to_string();
                                 last_text_len = accumulated_text.len();
                                 yield Ok(StreamChunk {
                                     delta,
@@ -1800,7 +1801,8 @@ impl LLMProvider for ClaudeCliProvider {
                             if let Some(result_text) = json.get("result").and_then(|v| v.as_str()) {
                                 // Emit any remaining text not yet sent
                                 if result_text.len() > last_text_len {
-                                    let delta = result_text[last_text_len..].to_string();
+                                    let safe_start = result_text.floor_char_boundary(last_text_len);
+                                    let delta = result_text[safe_start..].to_string();
                                     if !delta.is_empty() {
                                         yield Ok(StreamChunk {
                                             delta,
