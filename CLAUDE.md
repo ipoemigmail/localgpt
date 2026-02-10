@@ -32,7 +32,7 @@ LocalGPT is a local-only AI assistant with persistent markdown-based memory and 
 ### Core Modules (`src/`)
 
 - **agent/** - LLM interaction layer
-  - `providers.rs` - Trait `LLMProvider` with implementations for OpenAI, Anthropic, Ollama, and Claude CLI. Model prefix determines provider (`claude-cli/*` → Claude CLI, `gpt-*` → OpenAI, `claude-*` → Anthropic API, else Ollama)
+  - `providers.rs` - Trait `LLMProvider` with implementations for OpenAI, Anthropic, Ollama, Claude CLI, and Codex CLI. Model prefix determines provider (`claude-cli/*` → Claude CLI, `codex-cli/*` → Codex CLI, `gpt-*` → OpenAI, `claude-*` → Anthropic API, else Ollama)
   - `session.rs` - Conversation state with automatic compaction when approaching context window limits
   - `session_store.rs` - Session metadata store (`sessions.json`) with CLI session ID persistence
   - `system_prompt.rs` - Builds system prompt with identity, safety, workspace info, tools, skills, and special tokens

@@ -180,13 +180,12 @@ pub trait LLMProvider: Send + Sync {
 
 /// Resolve model alias to provider/model format (OpenClaw-compatible)
 fn resolve_model_alias(model: &str) -> String {
-    // OpenClaw-compatible aliases
     match model.to_lowercase().as_str() {
-        // Short aliases → latest 4.5 models
         "opus" => "anthropic/claude-opus-4-5".to_string(),
         "sonnet" => "anthropic/claude-sonnet-4-5".to_string(),
         "gpt" => "openai/gpt-4o".to_string(),
         "gpt-mini" => "openai/gpt-4o-mini".to_string(),
+        "codex" => "codex-cli/".to_string(),
         _ => model.to_string(),
     }
 }
@@ -278,6 +277,21 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
             )?))
         }
 
+        "codex-cli" => {
+            let cli_config = config.providers.codex_cli.as_ref();
+            let command = cli_config
+                .map(|c| c.command.as_str())
+                .unwrap_or("codex");
+            let model = if model_id.is_empty() {
+                cli_config
+                    .map(|c| c.model.as_str())
+                    .unwrap_or("")
+            } else {
+                &model_id
+            };
+            Ok(Box::new(CodexCliProvider::new(command, model, workspace)?))
+        }
+
         "ollama" => {
             let ollama_config = config.providers.ollama.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -310,8 +324,9 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
                 - anthropic/claude-opus-4-5, anthropic/claude-sonnet-4-5\n  \
                 - openai/gpt-4o, openai/gpt-4o-mini\n  \
                 - claude-cli/opus, claude-cli/sonnet\n  \
+                - codex-cli/, codex-cli/o3\n  \
                 - ollama/llama3, ollama/mistral\n\n\
-                Or use aliases: opus, sonnet, haiku, gpt, gpt-mini",
+                Or use aliases: opus, sonnet, haiku, gpt, gpt-mini, codex",
                 provider,
                 model
             )
@@ -1860,6 +1875,598 @@ impl LLMProvider for ClaudeCliProvider {
             // Update the provider's session state if we captured a new session ID
             if let Some(ref new_sid) = session_id_captured {
                 info!("Claude CLI streaming session: {}", new_sid);
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+// =============================================================================
+// Codex CLI Provider (OpenAI Codex CLI - subprocess-based)
+// =============================================================================
+
+/// Provider that uses the OpenAI Codex CLI (`codex exec`) as a subprocess.
+/// Similar to ClaudeCliProvider - delegates tool execution entirely to the CLI.
+/// Supports session resume via Codex thread IDs.
+///
+/// Usage: codex-cli/ (default model) or codex-cli/o3 (specific model)
+pub struct CodexCliProvider {
+    command: String,
+    model: String,
+    /// Working directory for CLI execution
+    workspace: std::path::PathBuf,
+    /// Session key for the session store (e.g., "main")
+    session_key: String,
+    /// LocalGPT session ID (for session store tracking)
+    localgpt_session_id: String,
+    /// Codex thread ID for multi-turn conversations (interior mutability for &self methods)
+    cli_session_id: StdMutex<Option<String>>,
+}
+
+/// Provider name for Codex CLI session storage
+const CODEX_CLI_PROVIDER: &str = "codex-cli";
+
+impl CodexCliProvider {
+    pub fn new(command: &str, model: &str, workspace: std::path::PathBuf) -> Result<Self> {
+        // Load existing Codex thread from session store
+        let session_key = "main".to_string();
+        let existing_session = load_cli_session_from_store(&session_key, CODEX_CLI_PROVIDER);
+
+        if let Some(ref sid) = existing_session {
+            debug!("Loaded existing Codex CLI session: {}", sid);
+        }
+
+        Ok(Self {
+            command: command.to_string(),
+            model: model.to_string(),
+            workspace,
+            session_key,
+            localgpt_session_id: uuid::Uuid::new_v4().to_string(),
+            cli_session_id: StdMutex::new(existing_session),
+        })
+    }
+
+    /// Build CLI arguments for a new session
+    fn build_new_session_args(&self, prompt: &str, output_json: bool) -> Vec<String> {
+        let mut args = vec!["exec".to_string()];
+
+        if output_json {
+            args.push("--json".to_string());
+        }
+
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        args.push("--skip-git-repo-check".to_string());
+
+        // Model (only if specified)
+        if !self.model.is_empty() {
+            args.push("-m".to_string());
+            args.push(self.model.clone());
+        }
+
+        // Working directory
+        args.push("-C".to_string());
+        args.push(self.workspace.to_string_lossy().to_string());
+
+        // Prompt as final argument
+        args.push(prompt.to_string());
+
+        args
+    }
+
+    /// Build CLI arguments for resuming an existing session
+    fn build_resume_args(
+        &self,
+        prompt: &str,
+        thread_id: &str,
+        output_json: bool,
+    ) -> Vec<String> {
+        let mut args = vec!["exec".to_string(), "resume".to_string()];
+
+        if output_json {
+            args.push("--json".to_string());
+        }
+
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+
+        // Thread ID
+        args.push(thread_id.to_string());
+
+        // Prompt
+        args.push(prompt.to_string());
+
+        args
+    }
+
+    /// Execute Codex CLI command, retrying with a new session if the existing one fails
+    async fn execute_cli_command(
+        &self,
+        prompt: &str,
+        existing_session: Option<&str>,
+    ) -> Result<(String, bool)> {
+        use std::process::Command;
+
+        // First attempt: try with existing session if available
+        if let Some(thread_id) = existing_session {
+            let args = self.build_resume_args(prompt, thread_id, true);
+
+            debug!(
+                "Codex CLI (resume): {} {:?} (cwd: {:?})",
+                self.command, args, self.workspace
+            );
+
+            let output = tokio::task::spawn_blocking({
+                let command = self.command.clone();
+                let args = args.clone();
+                let workspace = self.workspace.clone();
+                move || {
+                    Command::new(&command)
+                        .args(&args)
+                        .current_dir(&workspace)
+                        .output()
+                }
+            })
+            .await??;
+
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+            if output.status.success() || self.has_successful_turn(&stdout) {
+                return Ok((stdout, false));
+            }
+
+            // Check for session-related errors
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("not found")
+                || stderr.contains("does not exist")
+                || stderr.contains("No conversation")
+                || stderr.contains("No session")
+                || stdout.contains("\"type\":\"error\"")
+            {
+                info!(
+                    "Codex CLI session {} not found, creating new session",
+                    thread_id
+                );
+                if let Ok(mut cli_session) = self.cli_session_id.lock() {
+                    *cli_session = None;
+                }
+            } else {
+                anyhow::bail!(
+                    "Codex CLI failed: {}{}",
+                    stderr,
+                    if !stdout.is_empty() {
+                        format!("\nstdout: {}", stdout)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
+
+        // Create new session
+        let args = self.build_new_session_args(prompt, true);
+
+        debug!(
+            "Codex CLI (new): {} {:?} (cwd: {:?})",
+            self.command, args, self.workspace
+        );
+
+        let output = tokio::task::spawn_blocking({
+            let command = self.command.clone();
+            let args = args.clone();
+            let workspace = self.workspace.clone();
+            move || {
+                Command::new(&command)
+                    .args(&args)
+                    .current_dir(&workspace)
+                    .output()
+            }
+        })
+        .await??;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+        if !output.status.success() && !self.has_successful_turn(&stdout) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Codex CLI failed: {}", stderr);
+        }
+
+        Ok((stdout, true))
+    }
+
+    /// Check if JSONL output contains a successful turn
+    fn has_successful_turn(&self, stdout: &str) -> bool {
+        stdout.contains("\"type\":\"turn.completed\"")
+    }
+
+    /// Parse JSONL output from `codex exec --json`
+    /// Returns (response_text, thread_id, usage)
+    fn parse_codex_output(
+        &self,
+        stdout: &str,
+    ) -> Result<(String, Option<String>, Option<Usage>)> {
+        let mut response_text = String::new();
+        let mut thread_id: Option<String> = None;
+        let mut usage: Option<Usage> = None;
+
+        for line in stdout.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_str::<Value>(line) {
+                let event_type = json["type"].as_str().unwrap_or("");
+
+                match event_type {
+                    "thread.started" => {
+                        if let Some(tid) = json["thread_id"].as_str() {
+                            thread_id = Some(tid.to_string());
+                        }
+                    }
+                    "item.completed" => {
+                        if let Some(item) = json.get("item") {
+                            let item_type = item["type"].as_str().unwrap_or("");
+                            if item_type == "agent_message" {
+                                if let Some(text) = item["text"].as_str() {
+                                    response_text = text.to_string();
+                                }
+                            }
+                        }
+                    }
+                    "turn.completed" => {
+                        if let Some(u) = json.get("usage") {
+                            let input = u["input_tokens"].as_u64().unwrap_or(0)
+                                + u["cached_input_tokens"].as_u64().unwrap_or(0);
+                            let output = u["output_tokens"].as_u64().unwrap_or(0);
+                            usage = Some(Usage {
+                                input_tokens: input,
+                                output_tokens: output,
+                            });
+                        }
+                    }
+                    "error" => {
+                        let msg = json["message"].as_str().unwrap_or("Unknown Codex CLI error");
+                        anyhow::bail!("Codex CLI error: {}", msg);
+                    }
+                    "turn.failed" => {
+                        let msg = json["error"]["message"]
+                            .as_str()
+                            .unwrap_or("Unknown Codex CLI error");
+                        anyhow::bail!("Codex CLI turn failed: {}", msg);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if response_text.is_empty() {
+            // Fallback: return raw stdout if no agent_message found
+            response_text = stdout.trim().to_string();
+        }
+
+        Ok((response_text, thread_id, usage))
+    }
+
+    /// Build a combined prompt with system instructions inlined
+    /// (Codex CLI exec doesn't support --system-prompt)
+    fn build_prompt_with_system(prompt: &str, system_prompt: Option<&str>) -> String {
+        if let Some(sys) = system_prompt {
+            if !sys.is_empty() {
+                return format!(
+                    "[System Instructions]\n{}\n\n[User Message]\n{}",
+                    sys, prompt
+                );
+            }
+        }
+        prompt.to_string()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for CodexCliProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: Option<&[ToolSchema]>, // Ignored - Codex CLI handles its own tools
+    ) -> Result<LLMResponse> {
+        let prompt = build_prompt_from_messages(messages);
+        let system_prompt = extract_system_prompt(messages);
+
+        // Combine system prompt into user prompt (Codex exec has no --system-prompt flag)
+        let full_prompt =
+            Self::build_prompt_with_system(&prompt, system_prompt.as_deref());
+
+        // Get current CLI session state
+        let current_cli_session = self
+            .cli_session_id
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Session lock poisoned: {}", e))?
+            .clone();
+
+        // Execute with retry
+        let (stdout, _used_new_session) = self
+            .execute_cli_command(&full_prompt, current_cli_session.as_deref())
+            .await?;
+
+        // Parse JSONL output
+        let (response, new_thread_id, usage) = self.parse_codex_output(&stdout)?;
+
+        // Update session state and persist
+        if let Some(ref tid) = new_thread_id {
+            let mut cli_session = self
+                .cli_session_id
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Session lock poisoned: {}", e))?;
+            *cli_session = Some(tid.clone());
+
+            if let Err(e) = save_cli_session_to_store(
+                &self.session_key,
+                &self.localgpt_session_id,
+                CODEX_CLI_PROVIDER,
+                tid,
+            ) {
+                debug!("Failed to persist Codex CLI session: {}", e);
+            }
+
+            info!("Codex CLI session: {}", tid);
+        }
+
+        match usage {
+            Some(u) => Ok(LLMResponse::text_with_usage(response, u)),
+            None => Ok(LLMResponse::text(response)),
+        }
+    }
+
+    async fn summarize(&self, text: &str) -> Result<String> {
+        let messages = vec![Message {
+            role: Role::User,
+            content: format!(
+                "Summarize the following conversation concisely:\n\n{}",
+                text
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            images: Vec::new(),
+        }];
+
+        match self.chat(&messages, None).await?.content {
+            LLMResponseContent::Text(summary) => Ok(summary),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: Option<&[ToolSchema]>,
+    ) -> Result<StreamResult> {
+        let prompt = build_prompt_from_messages(messages);
+        let system_prompt = extract_system_prompt(messages);
+        let full_prompt =
+            Self::build_prompt_with_system(&prompt, system_prompt.as_deref());
+
+        // Get current CLI session state
+        let current_cli_session = self
+            .cli_session_id
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Session lock poisoned: {}", e))?
+            .clone();
+
+        // Build args based on session state
+        let args = if let Some(ref tid) = current_cli_session {
+            self.build_resume_args(&full_prompt, tid, true)
+        } else {
+            self.build_new_session_args(&full_prompt, true)
+        };
+
+        debug!(
+            "Codex CLI streaming: {} {:?} (cwd: {:?})",
+            self.command, args, self.workspace
+        );
+
+        // Spawn the CLI process with piped stdout
+        let mut child = tokio::process::Command::new(&self.command)
+            .args(&args)
+            .current_dir(&self.workspace)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn Codex CLI: {}", e))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+
+        // Clone session state for the stream closure
+        let session_key = self.session_key.clone();
+        let localgpt_session_id = self.localgpt_session_id.clone();
+        let cli_session_mutex = std::sync::Arc::new(StdMutex::new(
+            current_cli_session.clone(),
+        ));
+
+        // Create the stream
+        let stream = async_stream::stream! {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            let mut last_agent_text = String::new();
+            let mut last_text_len = 0;
+            let mut thread_id_captured: Option<String> = None;
+            let mut pending_commands: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.is_empty() {
+                    continue;
+                }
+
+                if let Ok(json) = serde_json::from_str::<Value>(&line) {
+                    let event_type = json["type"].as_str().unwrap_or("");
+
+                    match event_type {
+                        "thread.started" => {
+                            if let Some(tid) = json["thread_id"].as_str() {
+                                thread_id_captured = Some(tid.to_string());
+
+                                // Update session state immediately
+                                if let Ok(mut guard) = cli_session_mutex.lock() {
+                                    *guard = Some(tid.to_string());
+                                }
+
+                                // Persist to session store
+                                if let Err(e) = save_cli_session_to_store(
+                                    &session_key,
+                                    &localgpt_session_id,
+                                    CODEX_CLI_PROVIDER,
+                                    tid,
+                                ) {
+                                    debug!("Failed to persist Codex CLI session: {}", e);
+                                }
+
+                                debug!("Codex CLI thread started: {}", tid);
+                            }
+                        }
+
+                        "item.started" => {
+                            if let Some(item) = json.get("item") {
+                                let item_type = item["type"].as_str().unwrap_or("");
+                                if item_type == "command_execution" {
+                                    let item_id = item["id"].as_str().unwrap_or("").to_string();
+                                    let command = item["command"].as_str().unwrap_or("...");
+
+                                    // Truncate long commands for display
+                                    let display_cmd = if command.len() > 80 {
+                                        format!("{}...", &command[..77])
+                                    } else {
+                                        command.to_string()
+                                    };
+
+                                    pending_commands.insert(item_id, "Bash".to_string());
+
+                                    yield Ok(StreamChunk {
+                                        delta: format!("\n[Bash: {}]", display_cmd),
+                                        done: false,
+                                        tool_calls: None,
+                                    });
+                                }
+                            }
+                        }
+
+                        "item.completed" => {
+                            if let Some(item) = json.get("item") {
+                                let item_type = item["type"].as_str().unwrap_or("");
+
+                                match item_type {
+                                    "agent_message" => {
+                                        if let Some(text) = item["text"].as_str() {
+                                            let new_text = text.to_string();
+                                            // Calculate delta from last known text
+                                            if new_text.len() > last_text_len {
+                                                let safe_start = new_text.floor_char_boundary(last_text_len);
+                                                let delta = new_text[safe_start..].to_string();
+                                                last_text_len = new_text.len();
+                                                last_agent_text = new_text;
+
+                                                if !delta.is_empty() {
+                                                    yield Ok(StreamChunk {
+                                                        delta,
+                                                        done: false,
+                                                        tool_calls: None,
+                                                    });
+                                                }
+                                            } else if new_text != last_agent_text {
+                                                // Different message entirely (new agent_message after tool calls)
+                                                last_agent_text = new_text.clone();
+                                                last_text_len = new_text.len();
+
+                                                if !new_text.is_empty() {
+                                                    yield Ok(StreamChunk {
+                                                        delta: new_text,
+                                                        done: false,
+                                                        tool_calls: None,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    "command_execution" => {
+                                        let item_id = item["id"].as_str().unwrap_or("").to_string();
+                                        let exit_code = item["exit_code"].as_i64();
+                                        let _tool_name = pending_commands.remove(&item_id);
+
+                                        let status = match exit_code {
+                                            Some(0) => "done",
+                                            Some(_) => "failed",
+                                            None => "done",
+                                        };
+
+                                        yield Ok(StreamChunk {
+                                            delta: format!(" [{}]\n", status),
+                                            done: false,
+                                            tool_calls: None,
+                                        });
+                                    }
+
+                                    "reasoning" => {
+                                        // Optionally show reasoning as a subtle indicator
+                                        debug!("Codex reasoning: {:?}", item["text"]);
+                                    }
+
+                                    _ => {
+                                        debug!("Ignoring Codex item type: {}", item_type);
+                                    }
+                                }
+                            }
+                        }
+
+                        "turn.completed" => {
+                            // Signal completion
+                            yield Ok(StreamChunk {
+                                delta: String::new(),
+                                done: true,
+                                tool_calls: None,
+                            });
+                        }
+
+                        "error" => {
+                            let error_msg = json["message"]
+                                .as_str()
+                                .unwrap_or("Unknown Codex CLI error");
+                            yield Err(anyhow::anyhow!("Codex CLI error: {}", error_msg));
+                        }
+
+                        "turn.failed" => {
+                            let error_msg = json["error"]["message"]
+                                .as_str()
+                                .unwrap_or("Unknown Codex CLI error");
+                            yield Err(anyhow::anyhow!("Codex CLI turn failed: {}", error_msg));
+                        }
+
+                        _ => {
+                            debug!("Ignoring Codex stream event: {}", event_type);
+                        }
+                    }
+                }
+            }
+
+            // Wait for the process to complete
+            match child.wait().await {
+                Ok(status) if !status.success() => {
+                    if let Some(mut stderr) = child.stderr.take() {
+                        let mut error_buf = String::new();
+                        use tokio::io::AsyncReadExt;
+                        let _ = stderr.read_to_string(&mut error_buf).await;
+                        if !error_buf.is_empty() {
+                            yield Err(anyhow::anyhow!("Codex CLI failed: {}", error_buf));
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(anyhow::anyhow!("Failed to wait for Codex CLI process: {}", e));
+                }
+                _ => {}
+            }
+
+            if let Some(ref tid) = thread_id_captured {
+                info!("Codex CLI streaming session: {}", tid);
             }
         };
 

@@ -21,6 +21,10 @@
 # Claude CLI (local, no API key needed):
 #   - "claude-cli/opus", "claude-cli/sonnet", "claude-cli/haiku"
 #
+# Codex CLI (local, uses codex auth):
+#   - "codex-cli/"              (use codex default model)
+#   - "codex-cli/o3", "codex-cli/o4-mini"
+#
 # Ollama (local):
 #   - "ollama/llama3", "ollama/mistral", etc.
 #
@@ -53,6 +57,12 @@ base_url = "https://api.anthropic.com"
 # [providers.claude_cli]
 # command = "claude"
 # model = "opus"  # opus, sonnet, or haiku
+
+# Codex CLI configuration (uses local codex CLI command)
+# Requires codex CLI to be installed: https://github.com/openai/codex
+# [providers.codex_cli]
+# command = "codex"
+# model = ""  # Empty = use codex default model from ~/.codex/config.toml
 
 [heartbeat]
 # Enable automatic heartbeat

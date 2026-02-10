@@ -93,6 +93,9 @@ pub struct ProvidersConfig {
 
     #[serde(default)]
     pub claude_cli: Option<ClaudeCliConfig>,
+
+    #[serde(default)]
+    pub codex_cli: Option<CodexCliConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +129,15 @@ pub struct ClaudeCliConfig {
     pub command: String,
 
     #[serde(default = "default_claude_cli_model")]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexCliConfig {
+    #[serde(default = "default_codex_cli_command")]
+    pub command: String,
+
+    #[serde(default)]
     pub model: String,
 }
 
@@ -270,6 +282,9 @@ fn default_claude_cli_command() -> String {
 }
 fn default_claude_cli_model() -> String {
     "opus".to_string()
+}
+fn default_codex_cli_command() -> String {
+    "codex".to_string()
 }
 fn default_true() -> bool {
     true
